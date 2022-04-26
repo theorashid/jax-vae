@@ -1,0 +1,244 @@
+"""Variational Autoencoder example on continuous 1-D Gaussian process priors."""
+
+from typing import Iterator, Mapping, NamedTuple, Sequence, Tuple
+
+import haiku as hk
+import jax
+import jax.numpy as jnp
+import numpy as np
+from tinygp import kernels, GaussianProcess
+import optax
+import tensorflow_datasets as tfds
+from absl import app, flags, logging
+
+flags.DEFINE_integer("batch_size", 128, "Size of the batch to train on.")
+flags.DEFINE_float("learning_rate", 0.001, "Learning rate for the optimizer.")
+flags.DEFINE_integer("training_steps", 5000, "Number of training steps.")
+flags.DEFINE_integer("eval_frequency", 100, "How often to evaluate the model.")
+flags.DEFINE_integer("random_seed", 42, "Random seed.")
+FLAGS = flags.FLAGS
+
+
+PRNGKey = jnp.ndarray
+Batch = Mapping[str, np.ndarray]
+
+SAMPLE_SHAPE: Sequence[int] = (100, 1)
+
+
+# generate iterable dataset where each is batch
+# each batch is a dictionary with key ["sample"]
+# values are the array
+def generate_gp_samples(
+	X: jnp.ndarray,
+	num_draws: int,
+	var: float,
+	scale: float,
+	batch_size: int,
+	seed: int = 1
+) -> Iterator[jnp.ndarray]:
+	kernel = var * kernels.ExpSquared(scale=scale)
+	gp = GaussianProcess(kernel, X)
+
+	draws = gp.sample(jax.random.PRNGKey(seed=seed), shape=(num_draws, batch_size, ))
+	
+	draws = jax.numpy.reshape(draws, (-1, *SAMPLE_SHAPE))
+
+	return draws
+
+
+def load_dataset(split: str, batch_size: int) -> Iterator[Batch]:
+    ds = tfds.load(
+        "binarized_mnist",
+        split=split,
+        shuffle_files=True,
+        read_config=tfds.ReadConfig(shuffle_seed=FLAGS.random_seed),
+    )
+    ds = ds.shuffle(buffer_size=10 * batch_size, seed=FLAGS.random_seed)
+    ds = ds.batch(batch_size)
+    ds = ds.prefetch(buffer_size=5)
+    ds = ds.repeat()
+    return iter(
+        tfds.as_numpy(ds)
+    )  # dictionary. key ["image"]; values (128, 28, 28, 1) (batch, *MNIST_SHAPE)
+
+
+class Encoder(hk.Module):
+    """Encoder model."""
+
+    def __init__(
+        self, hidden_size1: int = 50, hidden_size2: int = 25, latent_size: int = 10
+    ):
+        super().__init__()
+        self._hidden_size1 = hidden_size1
+        self._hidden_size2 = hidden_size2
+        self._latent_size = latent_size
+        self.act = jax.nn.relu
+
+    def __call__(self, x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        x = hk.Flatten()(x)
+        x = hk.Sequential(
+            [
+                hk.Linear(self._hidden_size1),
+                self.act,
+                hk.Linear(self._hidden_size2),
+                self.act,
+            ]
+        )(x)
+
+        mean = hk.Linear(self._latent_size)(x)
+        log_stddev = hk.Linear(self._latent_size)(x)
+        stddev = jnp.exp(log_stddev)
+
+        return mean, stddev
+
+
+class Decoder(hk.Module):
+    """Decoder model."""
+
+    def __init__(
+        self,
+        hidden_size1: int = 25,
+        hidden_size2: int = 50,
+        output_shape: Sequence[int] = SAMPLE_SHAPE,
+    ):
+        super().__init__()
+        self._hidden_size1 = hidden_size1
+        self._hidden_size2 = hidden_size2
+        self._output_shape = output_shape
+        self.act = jax.nn.relu
+
+    def __call__(self, z: jnp.ndarray) -> jnp.ndarray:
+        output = hk.Sequential(
+            [
+                hk.Linear(self._hidden_size1),
+                self.act,
+                hk.Linear(self._hidden_size2),
+                self.act,
+                hk.Linear(np.prod(self._output_shape)),
+            ]
+        )(z)
+
+        output = jnp.reshape(output, (-1, *self._output_shape))
+
+        return output
+
+
+class VAEOutput(NamedTuple):
+    mean: jnp.ndarray
+    stddev: jnp.ndarray
+    output: jnp.ndarray
+
+
+class VariationalAutoEncoder(hk.Module):
+    """Main VAE model class, uses Encoder & Decoder under the hood."""
+
+    def __init__(
+        self,
+        hidden_size1: int = 50,
+        hidden_size2: int = 25,
+        latent_size: int = 10,
+        output_shape: Sequence[int] = SAMPLE_SHAPE,
+    ):
+        super().__init__()
+        self._hidden_size1 = hidden_size1
+        self._hidden_size2 = hidden_size2
+        self._latent_size = latent_size
+        self._output_shape = output_shape
+
+    def __call__(self, x: jnp.ndarray) -> VAEOutput:
+        x = x.astype(jnp.float32)
+        mean, stddev = Encoder(
+            self._hidden_size1, self._hidden_size2, self._latent_size
+        )(x)
+        z = mean + stddev * jax.random.normal(hk.next_rng_key(), mean.shape)
+        output = Decoder(self._hidden_size2, self._hidden_size1, self._output_shape)(z)
+
+        return VAEOutput(mean, stddev, output)
+
+
+def mean_squared_error(x1: jnp.ndarray, x2: jnp.ndarray) -> jnp.ndarray:
+    """Calculate mean squared error between two tensors.
+
+    Args:
+		x1: variable tensor
+		x2: variable tensor, must be of same shape as x1
+
+    Returns:
+		A scalar representing mean square error for the two input tensors.
+    """
+    if x1.shape != x2.shape:
+        raise ValueError("x1 and x2 must be of the same shape")
+
+    x1 = jnp.reshape(x1, (x1.shape[0], -1))
+    x2 = jnp.reshape(x2, (x2.shape[0], -1))
+
+    return jnp.mean(jnp.square(x1 - x2), axis=-1)
+
+
+def kl_gaussian(mean: jnp.ndarray, var: jnp.ndarray) -> jnp.ndarray:
+    r"""Calculate KL divergence between given and standard gaussian distributions.
+
+    KL(p, q) = H(p, q) - H(p) = -\int p(x)log(q(x))dx - -\int p(x)log(p(x))dx
+			= 0.5 * [log(|s2|/|s1|) - 1 + tr(s1/s2) + (m1-m2)^2/s2]
+			= 0.5 * [-log(|s1|) - 1 + tr(s1) + m1^2] (if m2 = 0, s2 = 1)
+
+    Args:
+		mean: mean vector of the first distribution
+		var: diagonal vector of covariance matrix of the first distribution
+
+    Returns:
+		A scalar representing KL divergence of the two Gaussian distributions.
+    """
+    return 0.5 * jnp.sum(-jnp.log(var) - 1.0 + var + jnp.square(mean), axis=-1)
+
+
+def main(_):
+    FLAGS.alsologtostderr = True
+
+    model = hk.transform(
+        lambda x: VariationalAutoEncoder()(x)
+    )  # pylint: disable=unnecessary-lambda
+    optimizer = optax.adam(FLAGS.learning_rate)
+
+    @jax.jit
+    def loss_fn(params: hk.Params, rng_key: PRNGKey, batch: Batch) -> jnp.ndarray:
+        """ELBO loss: E_p[log(x)] - KL(d||q), where p ~ Be(0.5) and q ~ N(0,1)."""
+        outputs: VAEOutput = model.apply(params, rng_key, batch["sample"])
+
+        log_likelihood = -mean_squared_error(batch["sample"], outputs.output)
+        kl = kl_gaussian(outputs.mean, jnp.square(outputs.stddev))
+        elbo = log_likelihood - kl
+
+        return -jnp.mean(elbo)
+
+    @jax.jit
+    def update(
+        params: hk.Params,
+        rng_key: PRNGKey,
+        opt_state: optax.OptState,
+        batch: Batch,
+    ) -> Tuple[hk.Params, optax.OptState]:
+        """Single SGD update step."""
+        grads = jax.grad(loss_fn)(params, rng_key, batch)
+        updates, new_opt_state = optimizer.update(grads, opt_state)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state
+
+    rng_seq = hk.PRNGSequence(FLAGS.random_seed)
+    params = model.init(next(rng_seq), np.zeros((1, *SAMPLE_SHAPE)))
+    opt_state = optimizer.init(params)
+
+    # can just generate new samples for train and test. Make an iterator
+    train_ds = load_dataset(tfds.Split.TRAIN, FLAGS.batch_size)
+    valid_ds = load_dataset(tfds.Split.TEST, FLAGS.batch_size)
+
+    for step in range(FLAGS.training_steps):
+        params, opt_state = update(params, next(rng_seq), opt_state, next(train_ds))
+
+        if step % FLAGS.eval_frequency == 0:
+            val_loss = loss_fn(params, next(rng_seq), next(valid_ds))
+            logging.info("STEP: %5d; Validation ELBO: %.3f", step, -val_loss)
+
+
+if __name__ == "__main__":
+    app.run(main)
