@@ -172,8 +172,12 @@ def main(_):
     optimizer = optax.adam(FLAGS.learning_rate)
 
     @jax.jit
-    def loss_fn(params: hk.Params, rng_key: PRNGKey, batch: Batch) -> jnp.ndarray:
-        """ELBO loss: E_p[log(x)] - KL(d||q), where p ~ Be(0.5) and q ~ N(0,1)."""
+    def loss_fn(
+        params: hk.Params,
+        rng_key: PRNGKey,
+        batch: Batch,
+    ) -> jnp.ndarray:
+        """ELBO: E_p[log(x)] - KL(d||q), where p ~ Be(0.5) and q ~ N(0,1)."""
         outputs: VAEOutput = model.apply(params, rng_key, batch["image"])
 
         log_likelihood = -binary_cross_entropy(batch["image"], outputs.logits)
@@ -203,7 +207,12 @@ def main(_):
     valid_ds = load_dataset(tfds.Split.TEST, FLAGS.batch_size)
 
     for step in range(FLAGS.training_steps):
-        params, opt_state = update(params, next(rng_seq), opt_state, next(train_ds))
+        params, opt_state = update(
+            params,
+            next(rng_seq),
+            opt_state,
+            next(train_ds),
+        )
 
         if step % FLAGS.eval_frequency == 0:
             val_loss = loss_fn(params, next(rng_seq), next(valid_ds))

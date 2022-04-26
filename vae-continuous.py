@@ -1,6 +1,6 @@
-"""Variational Autoencoder example on continuous 1-D Gaussian process priors."""
+"""Variational Autoencoder example on continuous Gaussian process priors."""
 
-from typing import Iterator, Mapping, NamedTuple, Sequence, Tuple
+from typing import Iterator, NamedTuple, Sequence, Tuple
 
 import haiku as hk
 import jax
@@ -10,11 +10,11 @@ import optax
 from absl import app, flags, logging
 from tinygp import GaussianProcess, kernels
 
-flags.DEFINE_integer("train_size", 8000, "Size of the training dataset.")
-flags.DEFINE_integer("test_size", 2000, "Size of the testing dataset.")
+flags.DEFINE_integer("train_size", 16000, "Size of the training dataset.")
+flags.DEFINE_integer("test_size", 4000, "Size of the testing dataset.")
 flags.DEFINE_integer("batch_size", 128, "Size of the batch to train on.")
 flags.DEFINE_float("learning_rate", 0.001, "Learning rate for the optimizer.")
-flags.DEFINE_integer("training_steps", 5000, "Number of training steps.")
+flags.DEFINE_integer("training_steps", 10000, "Number of training steps.")
 flags.DEFINE_integer("eval_frequency", 100, "How often to evaluate the model.")
 flags.DEFINE_integer("random_seed", 42, "Random seed.")
 FLAGS = flags.FLAGS
@@ -55,7 +55,10 @@ class Encoder(hk.Module):
     """Encoder model."""
 
     def __init__(
-        self, hidden_size1: int = 50, hidden_size2: int = 25, latent_size: int = 10
+        self,
+        hidden_size1: int = 50,
+        hidden_size2: int = 25,
+        latent_size: int = 10,
     ):
         super().__init__()
         self._hidden_size1 = hidden_size1
@@ -140,7 +143,11 @@ class VariationalAutoEncoder(hk.Module):
             self._hidden_size1, self._hidden_size2, self._latent_size
         )(x)
         z = mean + stddev * jax.random.normal(hk.next_rng_key(), mean.shape)
-        output = Decoder(self._hidden_size2, self._hidden_size1, self._output_shape)(z)
+        output = Decoder(
+            self._hidden_size2,
+            self._hidden_size1,
+            self._output_shape,
+        )(z)
 
         return VAEOutput(mean, stddev, output)
 
@@ -168,15 +175,15 @@ def kl_gaussian(mean: jnp.ndarray, var: jnp.ndarray) -> jnp.ndarray:
     r"""Calculate KL divergence between given and standard gaussian distributions.
 
     KL(p, q) = H(p, q) - H(p) = -\int p(x)log(q(x))dx - -\int p(x)log(p(x))dx
-                    = 0.5 * [log(|s2|/|s1|) - 1 + tr(s1/s2) + (m1-m2)^2/s2]
-                    = 0.5 * [-log(|s1|) - 1 + tr(s1) + m1^2] (if m2 = 0, s2 = 1)
+            = 0.5 * [log(|s2|/|s1|) - 1 + tr(s1/s2) + (m1-m2)^2/s2]
+            = 0.5 * [-log(|s1|) - 1 + tr(s1) + m1^2] (if m2 = 0, s2 = 1)
 
     Args:
-            mean: mean vector of the first distribution
-            var: diagonal vector of covariance matrix of the first distribution
+        mean: mean vector of the first distribution
+        var: diagonal vector of covariance matrix of the first distribution
 
     Returns:
-            A scalar representing KL divergence of the two Gaussian distributions.
+        A scalar representing KL divergence of the two Gaussian distributions.
     """
     return 0.5 * jnp.sum(-jnp.log(var) - 1.0 + var + jnp.square(mean), axis=-1)
 
@@ -190,8 +197,12 @@ def main(_):
     optimizer = optax.adam(FLAGS.learning_rate)
 
     @jax.jit
-    def loss_fn(params: hk.Params, rng_key: PRNGKey, batch: Batch) -> jnp.ndarray:
-        """ELBO loss: E_p[log(x)] - KL(d||q), where p ~ Be(0.5) and q ~ N(0,1)."""
+    def loss_fn(
+        params: hk.Params,
+        rng_key: PRNGKey,
+        batch: Batch,
+    ) -> jnp.ndarray:
+        """ELBO: E_p[log(x)] - KL(d||q), where p ~ Be(0.5) and q ~ N(0,1)."""
         outputs: VAEOutput = model.apply(params, rng_key, batch)
 
         log_likelihood = -mean_squared_error(batch, outputs.output)
@@ -220,14 +231,27 @@ def main(_):
     X = jnp.linspace(0, 10, 100)
 
     train_ds = generate_gp_samples(
-        X, var=1.0, scale=1.0, num_draws=FLAGS.train_size, batch_size=FLAGS.batch_size
+        X,
+        var=1.0,
+        scale=1.0,
+        num_draws=FLAGS.train_size,
+        batch_size=FLAGS.batch_size,
     )
     valid_ds = generate_gp_samples(
-        X, var=1.0, scale=1.0, num_draws=FLAGS.test_size, batch_size=FLAGS.batch_size
+        X,
+        var=1.0,
+        scale=1.0,
+        num_draws=FLAGS.test_size,
+        batch_size=FLAGS.batch_size,
     )
 
     for step in range(FLAGS.training_steps):
-        params, opt_state = update(params, next(rng_seq), opt_state, next(train_ds))
+        params, opt_state = update(
+            params,
+            next(rng_seq),
+            opt_state,
+            next(train_ds),
+        )
 
         if step % FLAGS.eval_frequency == 0:
             val_loss = loss_fn(params, next(rng_seq), next(valid_ds))
