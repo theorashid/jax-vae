@@ -8,9 +8,10 @@ import jax.numpy as jnp
 import numpy as np
 from tinygp import kernels, GaussianProcess
 import optax
-import tensorflow_datasets as tfds
 from absl import app, flags, logging
 
+flags.DEFINE_integer("train_size", 800, "Size of the training dataset.")
+flags.DEFINE_integer("test_size", 200, "Size of the testing dataset.")
 flags.DEFINE_integer("batch_size", 128, "Size of the batch to train on.")
 flags.DEFINE_float("learning_rate", 0.001, "Learning rate for the optimizer.")
 flags.DEFINE_integer("training_steps", 5000, "Number of training steps.")
@@ -20,46 +21,28 @@ FLAGS = flags.FLAGS
 
 
 PRNGKey = jnp.ndarray
-Batch = Mapping[str, np.ndarray]
+Batch = jnp.ndarray
 
 SAMPLE_SHAPE: Sequence[int] = (100, 1)
 
 
-# generate iterable dataset where each is batch
-# each batch is a dictionary with key ["sample"]
-# values are the array
 def generate_gp_samples(
 	X: jnp.ndarray,
-	num_draws: int,
 	var: float,
 	scale: float,
+	num_draws: int,
 	batch_size: int,
+	sample_shape: Sequence[int] = SAMPLE_SHAPE,
 	seed: int = 1
-) -> Iterator[jnp.ndarray]:
+) -> Iterator[Batch]:
 	kernel = var * kernels.ExpSquared(scale=scale)
 	gp = GaussianProcess(kernel, X)
 
-	draws = gp.sample(jax.random.PRNGKey(seed=seed), shape=(num_draws, batch_size, ))
+	draws = gp.sample(jax.random.PRNGKey(seed=seed), shape=(num_draws, batch_size,))
 	
-	draws = jax.numpy.reshape(draws, (-1, *SAMPLE_SHAPE))
+	draws = jnp.reshape(draws, (-1, *sample_shape))
 
-	return draws
-
-
-def load_dataset(split: str, batch_size: int) -> Iterator[Batch]:
-    ds = tfds.load(
-        "binarized_mnist",
-        split=split,
-        shuffle_files=True,
-        read_config=tfds.ReadConfig(shuffle_seed=FLAGS.random_seed),
-    )
-    ds = ds.shuffle(buffer_size=10 * batch_size, seed=FLAGS.random_seed)
-    ds = ds.batch(batch_size)
-    ds = ds.prefetch(buffer_size=5)
-    ds = ds.repeat()
-    return iter(
-        tfds.as_numpy(ds)
-    )  # dictionary. key ["image"]; values (128, 28, 28, 1) (batch, *MNIST_SHAPE)
+	return iter(draws)
 
 
 class Encoder(hk.Module):
@@ -226,11 +209,24 @@ def main(_):
 
     rng_seq = hk.PRNGSequence(FLAGS.random_seed)
     params = model.init(next(rng_seq), np.zeros((1, *SAMPLE_SHAPE)))
-    opt_state = optimizer.init(params)
+	opt_state = optimizer.init(params)
 
-    # can just generate new samples for train and test. Make an iterator
-    train_ds = load_dataset(tfds.Split.TRAIN, FLAGS.batch_size)
-    valid_ds = load_dataset(tfds.Split.TEST, FLAGS.batch_size)
+	X = jnp.linspace(0, 10, 100)
+
+	train_ds = generate_gp_samples(
+		X,
+		var=1.0,
+		scale=1.0,
+		num_draws=FLAGS.train_size,
+		batch_size=FLAGS.batch_size
+	)
+	valid_ds = generate_gp_samples(
+		X,
+		var=1.0,
+		scale=1.0,
+		num_draws=FLAGS.test_size,
+		batch_size=FLAGS.batch_size
+	)
 
     for step in range(FLAGS.training_steps):
         params, opt_state = update(params, next(rng_seq), opt_state, next(train_ds))
