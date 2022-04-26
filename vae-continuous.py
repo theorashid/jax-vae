@@ -1,6 +1,6 @@
 """Variational Autoencoder example on continuous Gaussian process priors."""
 
-from typing import Iterator, NamedTuple, Sequence, Tuple
+from typing import Iterator, NamedTuple, Sequence, Tuple, Type
 
 import haiku as hk
 import jax
@@ -21,7 +21,7 @@ FLAGS = flags.FLAGS
 
 
 PRNGKey = jnp.ndarray
-Batch = jnp.ndarray
+Batch = Type[jnp.ndarray]
 
 SAMPLE_SHAPE: Sequence[int] = (100, 1)
 
