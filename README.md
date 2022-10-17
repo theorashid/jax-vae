@@ -1,5 +1,5 @@
 # jax-vae
-_Project has been dropped in favour of a [GPJax](https://github.com/thomaspinder/GPJax) implementation._
+_Project has been extended to variational graph autoencoders in [salfaris/PriorVGAE](https://github.com/salfaris/PriorVGAE)._
 
 Variational autoencoder implementation on categorical and continuous datasets using [dm-haiku](https://github.com/deepmind/dm-haiku).
 
